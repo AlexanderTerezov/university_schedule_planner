@@ -1,4 +1,3 @@
-
 """Step 2: Build, solve, and verify the timetable using OR-Tools CP-SAT."""
 
 import datetime as dt
@@ -8,6 +7,7 @@ from dataclasses import dataclass, field
 from ortools.sat.python import cp_model
 
 import config
+import importer
 
 
 DAY = 24 * 60
@@ -174,6 +174,12 @@ def unmet_preferences(placement):
     if not course.rooms:
         unmet.append("no room preference or room assigned")
 
+    session = placement.session
+    if session.resized and session.length != course.duration:
+        unmet.append(
+            f"length: {session.length} h instead of the usual {course.duration} h"
+        )
+
     return unmet
 
 
@@ -195,8 +201,12 @@ class Progress(cp_model.CpSolverSolutionCallback):
             )
 
 
-def solve(sessions, log=print):
-    """Schedule sessions. Return (placements, solver statistics)."""
+def solve(sessions, log=print, fixed=None, seconds=None, hint=None):
+    """Schedule sessions. Return (placements, solver statistics).
+
+    fixed: optional {session id: Placement}. Those sessions are pinned to the given day, time and room.
+    hint: optional list of Placements used as the solver's starting point (e.g. from greedy.build).
+    """
     sessions = list(sessions)
 
     if not sessions:
@@ -209,11 +219,6 @@ def solve(sessions, log=print):
 
     model = cp_model.CpModel()
     slots = {}
-
-	
-    slot_sessions = defaultdict(list)
-    for session in sessions:
-        slot_sessions[slot_key(session)].append(session)
 
     by_teacher = defaultdict(list)
     by_students = defaultdict(list)
@@ -250,12 +255,9 @@ def solve(sessions, log=print):
         slot = slots[key]
 
         # Penalize all teaching hours lost by leaving this slot unscheduled.
-        parallel_count = len(slot_sessions[key])
+        # (This loop already runs once per session, so parallel groups are counted once each.)
         penalties.append(
-            config.W_UNSCHEDULED_PER_HOUR
-            * session.length
-            * parallel_count
-            * (1 - slot.present)
+            config.W_UNSCHEDULED_PER_HOUR * session.length * (1 - slot.present)
         )
 
         # A slot must satisfy each preference or incur its penalty.
@@ -340,7 +342,27 @@ def solve(sessions, log=print):
 
     # Keep equal-length sessions in chronological order.
     # Penalize scheduling multiple sessions in a chain on the same day.
-    for chain in chains.values():
+    course_of = {id(session.course): session.course for session in sessions}
+    for chain_key, chain in chains.items():
+        # Two sessions of the same lecture on one day with a break in between: strongly discouraged.
+        if course_of[chain_key[0]].kind == importer.LECTURE and config.W_SAME_DAY_GAP:
+            for i, a in enumerate(chain):
+                for b in chain[i + 1:]:
+                    same = model.NewBoolVar(f"same_day_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
+                    day_a = sum(d * v for d, v in enumerate(a.on_day))
+                    day_b = sum(d * v for d, v in enumerate(b.on_day))
+                    model.Add(day_a == day_b).OnlyEnforceIf(same) # pyright: ignore[reportAttributeAccessIssue]
+                    model.Add(day_a != day_b).OnlyEnforceIf(same.Not()) # pyright: ignore[reportAttributeAccessIssue]
+                    touch_ab = model.NewBoolVar(f"touch_ab_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
+                    touch_ba = model.NewBoolVar(f"touch_ba_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
+                    model.Add(a.start + a.length_min == b.start).OnlyEnforceIf(touch_ab) # pyright: ignore[reportAttributeAccessIssue]
+                    model.Add(a.start + a.length_min != b.start).OnlyEnforceIf(touch_ab.Not()) # pyright: ignore[reportAttributeAccessIssue]
+                    model.Add(b.start + b.length_min == a.start).OnlyEnforceIf(touch_ba) # pyright: ignore[reportAttributeAccessIssue]
+                    model.Add(b.start + b.length_min != a.start).OnlyEnforceIf(touch_ba.Not()) # pyright: ignore[reportAttributeAccessIssue]
+                    gapped = model.NewBoolVar(f"gapped_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
+                    model.AddBoolOr([a.present.Not(), b.present.Not(), same.Not(), touch_ab, touch_ba, gapped]) # pyright: ignore[reportAttributeAccessIssue]
+                    penalties.append(config.W_SAME_DAY_GAP * gapped)
+
         for first, second in zip(chain, chain[1:]):
             if first.length_min == second.length_min:
                 model.AddImplication(second.present, first.present) # pyright: ignore[reportAttributeAccessIssue]
@@ -358,6 +380,24 @@ def solve(sessions, log=print):
                 )
                 penalties.append(config.W_SAME_DAY * extra)
 
+    # Soft rule: an exercise should not begin before the first lecture of its subject has finished.
+    # Compared on the first session of each exercise group; nothing is charged if either side is unplaced.
+    courses = {id(session.course): session.course for session in sessions}
+    for lecture, exercise in importer.link_lectures(list(courses.values())):
+        lecture_chain = chains.get((id(lecture), 1))
+        if not lecture_chain:
+            continue
+        first_lecture = lecture_chain[0]
+        for key, chain in chains.items():
+            if key[0] != id(exercise):
+                continue
+            first_exercise = chain[0]
+            too_early = model.NewBoolVar(f"exercise_before_lecture_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
+            model.Add( # pyright: ignore[reportAttributeAccessIssue]
+                first_exercise.start >= first_lecture.start + first_lecture.length_min
+            ).OnlyEnforceIf([first_exercise.present, first_lecture.present, too_early.Not()])
+            penalties.append(config.W_LECTURE_FIRST * too_early)
+
     # Penalize cohort daily loads above the configured comfort limit.
     for student_set, entries in cohort_slots.items():
         for day in range(config.NUM_DAYS):
@@ -373,11 +413,45 @@ def solve(sessions, log=print):
             )
             penalties.append(config.W_LONG_DAY * excess)
 
+    # Sessions placed in an earlier round stay exactly where they are.
+    for session in sessions:
+        placed = (fixed or {}).get(session.id)
+        if placed is None:
+            continue
+        slot = slots[slot_key(session)]
+        model.Add(slot.present == 1) # pyright: ignore[reportAttributeAccessIssue]
+        model.Add(slot.on_day[placed.day] == 1) # pyright: ignore[reportAttributeAccessIssue]
+        model.Add(slot.on_time[placed.start] == 1) # pyright: ignore[reportAttributeAccessIssue]
+        for room, _, literal in room_literals.get(session.id, ()):
+            model.Add(literal == int(room == placed.room)) # pyright: ignore[reportAttributeAccessIssue]
+
+    if hint:
+        hinted = {p.session.id: p for p in hint}
+        seen = set()
+        for session in sessions:
+            p = hinted.get(session.id)
+            if p is None:
+                continue
+            key = slot_key(session)
+            slot = slots[key]
+            if key not in seen:
+                seen.add(key)
+                model.AddHint(slot.present, int(p.scheduled)) # pyright: ignore[reportAttributeAccessIssue]
+                for d, var in enumerate(slot.on_day):
+                    model.AddHint(var, int(p.scheduled and d == p.day)) # pyright: ignore[reportAttributeAccessIssue]
+                for minute, var in slot.on_time.items():
+                    model.AddHint(var, int(p.scheduled and minute == p.start)) # pyright: ignore[reportAttributeAccessIssue]
+                model.AddHint(slot.start, p.day * DAY + p.start if p.scheduled else 0) # pyright: ignore[reportAttributeAccessIssue]
+            for room, _, literal in room_literals.get(session.id, ()):
+                model.AddHint(literal, int(p.scheduled and room == p.room)) # pyright: ignore[reportAttributeAccessIssue]
+
     model.Minimize(sum(penalties)) # pyright: ignore[reportAttributeAccessIssue]
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = config.SOLVER_SECONDS
+    solver.parameters.max_time_in_seconds = seconds or config.SOLVER_SECONDS
     solver.parameters.num_workers = config.SOLVER_WORKERS
+    if hint:
+        solver.parameters.repair_hint = True
 
     log(
         f"Solving {len(sessions)} sessions across "
@@ -432,6 +506,144 @@ def solve(sessions, log=print):
         "seconds": solver.WallTime(),
     }
 
+    return placements, stats
+
+
+def split_hours(hours, target):
+    """Cut `hours` into classes of `target` hours; the last one takes what is left.
+
+    A leftover shorter than MIN_LENGTH is topped up from the classes before it, or merged into the last one.
+    """
+    low = min(config.MIN_LENGTH, hours)
+    count = -(-hours // target)
+    parts = [target] * (count - 1) + [hours - target * (count - 1)]
+    if parts[-1] < low and count > 1:
+        need = low - parts[-1]
+        for i in range(count - 2, -1, -1):
+            give = min(need, parts[i] - low)
+            parts[i] -= give
+            parts[-1] += give
+            need -= give
+            if not need:
+                break
+        if need:
+            last = parts.pop()
+            parts[-1] += last
+    return parts
+
+
+def resplit(placements, offset):
+    """New sessions for the hours that are still unplaced, cut at (usual length + offset) hours."""
+    next_id = max(p.session.id for p in placements) + 1
+    next_part = defaultdict(int)
+    lost = defaultdict(list)
+    for p in placements:
+        s = p.session
+        next_part[id(s.course)] = max(next_part[id(s.course)], s.part + 1)
+        if not p.scheduled:
+            lost[(id(s.course), s.group)].append(s)
+
+    new = []
+    for (course_id, group), old in lost.items():
+        course = old[0].course
+        target = min(max(course.duration + offset, config.MIN_LENGTH), config.MAX_LENGTH)
+        for i, length in enumerate(split_hours(sum(s.length for s in old), target)):
+            new.append(importer.Session(next_id, course, group, next_part[course_id] + i,
+                                        length, old[0].teachers, resized=True))
+            next_id += 1
+    return new
+
+
+def renumber_parts(placements):
+    """Part 1, 2, 3... of every course group in time order (repairs leave gaps in the numbering)."""
+    chains = defaultdict(list)
+    for p in placements:
+        chains[(id(p.session.course), p.session.group)].append(p)
+    for chain in chains.values():
+        chain.sort(key=lambda p: (not p.scheduled, p.day, p.start, p.session.part))
+        for i, p in enumerate(chain):
+            p.session.part = i
+
+
+def solve_flexible(sessions, log=print):
+    """Greedy start (with length repair), local search, then CP-SAT improvement from that start."""
+    import greedy
+
+    sessions = list(sessions)
+    placements = greedy.build(sessions)
+    greedy_log = []
+    total = sum(s.length for s in sessions)
+
+    def lost_hours(plist):
+        return sum(p.session.length for p in plist if not p.scheduled)
+
+    log(f"Greedy start: {total - lost_hours(placements)}/{total} h placed in the usual lengths")
+    for number, offset in enumerate(config.REPAIR_LENGTH_OFFSETS, start=1):
+        if not lost_hours(placements):
+            break
+        new = resplit(placements, offset)
+        kept = [p for p in placements if p.scheduled]
+        sessions = [p.session for p in kept] + new
+        before = lost_hours(placements)
+        placements = greedy.build(sessions, placed={p.session.id: p for p in kept})
+        greedy_log.append(f"greedy round {number} ({offset:+d} h): {before} -> {lost_hours(placements)} h unplaced")
+        log("  " + greedy_log[-1])
+
+    # --- local search with re-cutting, until it stalls, the time is up, or everything is placed
+    import time
+    interrupted = False
+    offset = 0
+    phase_start = last_gain = time.time()
+    best = lost_hours(placements)
+    log(f"Local search from {best} h unplaced (Ctrl+C stops it and keeps the best timetable)")
+    try:
+        step = 0
+        while best and time.time() - phase_start < config.LOCAL_SEARCH_SECONDS:
+            remaining = config.LOCAL_SEARCH_SECONDS - (time.time() - phase_start)
+            placements, _ = greedy.improve(sessions, placements, remaining, config.LOCAL_SEARCH_WINDOW, log)
+            if config.REPAIR_LENGTH_OFFSETS:
+                offset = config.REPAIR_LENGTH_OFFSETS[step % len(config.REPAIR_LENGTH_OFFSETS)]
+                step += 1
+                kept = [p for p in placements if p.scheduled]
+                sessions = [p.session for p in kept] + resplit(placements, offset)
+                placements = greedy.build(sessions, placed={p.session.id: p for p in kept})
+            now = lost_hours(placements)
+            if now < best:
+                best, last_gain = now, time.time()
+                log(f"  {best} h unplaced after re-cut {offset:+d} h" if config.REPAIR_LENGTH_OFFSETS else f"  {best} h unplaced")
+            if time.time() - last_gain > config.LOCAL_SEARCH_STALL_SECONDS:
+                log("  no gain for a long time - local search stops")
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        log("\nInterrupted - keeping the timetable found so far")
+    greedy_log.append(f"local search: {best} h unplaced")
+    if interrupted:
+        stats = {"status": "LOCAL SEARCH", "objective": 0, "bound": 0, "seconds": 0, "repair": greedy_log}
+        renumber_parts(placements)
+        return placements, stats
+
+    start = placements
+    stats = {"status": "LOCAL SEARCH", "objective": 0, "bound": 0, "seconds": 0}
+    if config.USE_CPSAT:
+        try:
+            candidate, cp_stats = solve(sessions, log, hint=start)
+        except RuntimeError as error:      # solver found nothing in time
+            log(f"  CP-SAT gave no result ({error}); keeping the local-search timetable")
+        else:
+            mine = sum(p.session.length for p in start if not p.scheduled)
+            theirs = sum(p.session.length for p in candidate if not p.scheduled)
+            if theirs <= mine:
+                placements, stats = candidate, cp_stats
+            else:                          # never trade placed classes for the solver's soft-preference polish
+                log(f"  CP-SAT left {theirs} h unplaced vs {mine} h from the local search; keeping the local search")
+    repair = list(greedy_log)
+    seconds = stats["seconds"]
+
+    # summary of the greedy / local-search steps
+    stats["seconds"] = seconds
+    stats["repair"] = repair
+    renumber_parts(placements)
     return placements, stats
 
 

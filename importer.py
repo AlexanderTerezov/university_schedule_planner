@@ -87,6 +87,7 @@ class Session:
     part: int            # 0, 1, 2... position among the sessions of this group
     length: int          # hours
     teachers: tuple      # who has to be present
+    resized: bool = False  # True when a repair round cut it with a length other than the usual one
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +133,11 @@ def read_raw(path):
 
     ws = wb[config.EXERCISES_SHEET]
     _fill_merged_cells(ws)
-    for r, v in _data_rows(ws, 14):
-        # hours = СУ + ПУ + ЛУ. The sheet's SUM column is a formula; we don't trust it.
+    for r, v in _data_rows(ws, 13):
+        # Columns: №, Дисциплина, СУ, ПУ, ЛУ, Специалност и курс, Брой групи, Зала x3,
+        # Преподавател, Продължение, Изисквания. hours = СУ + ПУ + ЛУ (there is no SUM column).
         raw.append(dict(kind=EXERCISE, sheet=ws.title, row=r, subject=v[1], hours=list(v[2:5]),
-                        spec=v[6], groups=v[7], rooms=v[8:11], teacher=v[11], cont=v[12], req=v[13]))
+                        spec=v[5], groups=v[6], rooms=v[7:10], teacher=v[10], cont=v[11], req=v[12]))
     return raw
 
 
@@ -173,19 +175,20 @@ def parse_cohorts(text, spelling, note):
 
 
 def parse_rooms(cells, note):
-    """Three preference cells -> room names, best first. 'кабинет 312', '146 A', '320/321' are handled."""
+    """Three preference cells -> room names, best first. 'кабинет 312', '146 A', '320/321' are handled.
+    Text without a number ('в мемф', 'кабинет') is kept as a room name too."""
     rooms = []
     for cell in cells:
         text = clean(cell)
         if "+" in text:
             note("WARNING", f"room cell {text!r} uses '+' (several rooms at once?) - treated as alternatives")
         for part in re.split(r"[,/+]", text):
-            room = re.sub(r"(?i)кабинет", "", part).replace(" ", "").upper().translate(_LOOKALIKE)
             if not part.strip():
                 continue
+            room = re.sub(r"(?i)кабинет", "", part).replace(" ", "").upper().translate(_LOOKALIKE)
             if not any(ch.isdigit() for ch in room):
-                note("WARNING", f"not a room name, ignored: {part.strip()!r}")
-                continue
+                # no room number ("в мемф", "кабинет"): any text is accepted as a room name of its own
+                room = re.sub(r"\s+", " ", part).strip().upper().translate(_LOOKALIKE)
             room = config.ROOM_ALIASES.get(room, room)
             if room not in rooms:
                 rooms.append(room)
@@ -330,6 +333,9 @@ def _build_course(rec, subject, teacher_index, spelling, note):
     rooms = parse_rooms(rec["rooms"], note)
     if not rooms:
         note("WARNING", "no room given")
+    if rooms and groups > 1 and len(teachers) == groups and len(rooms) < groups:
+        note("WARNING", f"{groups} groups run in parallel but only {len(rooms)} room(s) listed - "
+                        f"they cannot all be placed")
 
     return Course(rec["kind"], rec["sheet"], rec["row"], subject, hours, cohorts, groups, duration,
                   teachers, rooms, parse_requirements(rec["req"], note))
@@ -362,6 +368,26 @@ def load_courses(path):
         if n <= 2:
             issues.append(Issue("INFO", "cohorts", 0, "", f"'{cohort}' appears in only {n} course(s) - typo?"))
     return courses, issues, rows_read
+
+
+def _subject_key(name):
+    """Subject name reduced to letters and digits, so spacing, case and punctuation do not matter."""
+    return re.sub(r"[\W_]+", "", name.lower().translate(str.maketrans("abcehkmoptx", "авсенкмортх")))
+
+
+def link_lectures(courses):
+    """Pairs (lecture, exercise) of the same subject for the same students.
+
+    Matched by subject name AND at least one shared cohort, so a subject with the same
+    name in an unrelated specialty is not linked by accident."""
+    lectures = defaultdict(list)
+    for course in courses:
+        if course.kind == LECTURE:
+            lectures[_subject_key(course.subject)].append(course)
+    return [(lecture, course)
+            for course in courses if course.kind == EXERCISE
+            for lecture in lectures.get(_subject_key(course.subject), ())
+            if set(lecture.cohorts) & set(course.cohorts)]
 
 
 def expand_sessions(courses):

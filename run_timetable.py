@@ -1,4 +1,3 @@
-
 """Run the timetable optimizer and export the results to Excel.
 
 Usage:
@@ -63,7 +62,10 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
 
     print("\n2/5 Solving the timetable...")
 
-    placements, stats = model.solve(sessions)
+    placements, stats = model.solve_flexible(sessions)
+
+    for line in stats.get("repair", []):
+        print(f"   Repair {line}")
 
     print("\n3/5 Verifying hard constraints...")
 
@@ -134,7 +136,8 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
         {"Metric": "Solver time (seconds)", "Value": stats["seconds"]},
         {"Metric": "Input rows read", "Value": str(dict(rows_read))},
         {"Metric": "Courses imported", "Value": len(courses)},
-        {"Metric": "Sessions generated", "Value": len(sessions)},
+        {"Metric": "Sessions generated", "Value": len(placements)},
+        {"Metric": "Length repair rounds", "Value": "; ".join(stats.get("repair", [])) or "none needed"},
         {"Metric": "Sessions scheduled", "Value": len(scheduled)},
         {"Metric": "Sessions unscheduled", "Value": len(unscheduled)},
         {"Metric": "Validation problems", "Value": len(validation_problems)},
