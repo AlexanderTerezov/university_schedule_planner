@@ -1,11 +1,17 @@
-"""Fast constructive timetable plus local search (no solver).
+"""Constructive timetable plus local search.
+
+Hard rules (a class is never placed against them):
+  * a teacher, a student group or a room is in one place at a time; working hours; lunch;
+  * parts of a course group in order (equal-length parts); parallel groups at the same time;
+  * at most ONE session per day for every course group;
+  * every exercise comes after the first lecture of its subject (matched by name + shared cohort), and when a
+    lecture and an exercise of the same subject fall on one day, the lecture is first.
 
 build():    classes are placed wave by wave (every course's 1st session, then every 2nd ...), hardest first,
-            each at the cheapest legal day/time/room. Same hard rules and penalties as model.py.
+            each at the cheapest legal day/time/room.
 improve():  takes classes that are still unplaced, finds the day/time where only 1-3 placed classes are in the
             way, moves those out, puts the unplaced class in and tries to re-place the moved ones elsewhere.
             The change is kept only if no hours are lost (and usually some are gained), otherwise undone.
-The result can be handed to CP-SAT as a hint.
 """
 import random
 import time
@@ -80,11 +86,14 @@ class Scheduler:
         self.chain_day = defaultdict(list)
 
         courses = {id(s.course): s.course for s in self.sessions}
-        self.first_lectures = defaultdict(list)
+        self.course_units = defaultdict(list)
+        for u in self.units.values():
+            self.course_units[id(u.course)].append(u)
+        self.lectures_of = defaultdict(list)      # exercise course id -> ids of its lecture courses
+        self.exercises_of = defaultdict(list)     # lecture course id -> ids of its exercise courses
         for lecture, exercise in importer.link_lectures(list(courses.values())):
-            chain = self.chains.get((id(lecture), 1))
-            if chain:
-                self.first_lectures[id(exercise)].append(chain[0])
+            self.lectures_of[id(exercise)].append(id(lecture))
+            self.exercises_of[id(lecture)].append(id(exercise))
 
         self.teacher_load = defaultdict(int)
         for s in self.sessions:
@@ -142,19 +151,10 @@ class Scheduler:
         w_room = config.W_ROOM
         for _, (_, rank) in rooms.items():
             cost += w_room[min(rank, len(w_room) - 1)]
-        for o in self.chain_day.get((u.chain, day), ()):
-            cost += config.W_SAME_DAY
-            if u.course.kind == importer.LECTURE and config.W_SAME_DAY_GAP:
-                if not (o.abs_end == abs_start or abs_start + u.length == o.abs_start):
-                    cost += config.W_SAME_DAY_GAP
         for st in u.students:
             have = self.cohort_hours.get((st, day), 0)
             cost += config.W_LONG_DAY * (max(0, have + u.hours - config.MAX_DAILY_HOURS)
                                          - max(0, have - config.MAX_DAILY_HOURS))
-        if u.pos == 0:
-            for fl in self.first_lectures.get(id(u.course), ()):
-                if fl.done and abs_start < fl.abs_end:
-                    cost += config.W_LECTURE_FIRST
         return cost
 
     def min_abs(self, u):
@@ -162,6 +162,85 @@ class Scheduler:
         if u.prev is not None and u.prev.length == u.length:
             return u.prev.abs_end if u.prev.done else None
         return 0
+
+    # ------------------------------------------------------------------ lecture / exercise rules
+    def first_end(self, course_id):
+        """End (absolute minutes) of the earliest placed session of a course, or None."""
+        ends = [x.abs_end for x in self.course_units.get(course_id, ()) if x.done]
+        return min(ends) if ends else None
+
+    def rule_info(self, u):
+        """What the placed lectures / exercises demand of u. None = u cannot be placed now (lecture missing)."""
+        info = {"lo": 0, "day_end": {}, "min_y": None, "others_first": None, "day_start": {}}
+        cid = id(u.course)
+        if u.course.kind == importer.EXERCISE:
+            for lc in self.lectures_of.get(cid, ()):
+                fe = self.first_end(lc)
+                if fe is None:
+                    return None                    # the lecture is not placed yet
+                info["lo"] = max(info["lo"], fe)
+                for x in self.course_units.get(lc, ()):
+                    if x.done:
+                        info["day_end"][x.day] = max(info["day_end"].get(x.day, 0), x.abs_end)
+        else:
+            ys = [y for ec in self.exercises_of.get(cid, ()) for y in self.course_units.get(ec, ()) if y.done]
+            if ys:
+                info["min_y"] = min(y.abs_start for y in ys)
+                for y in ys:
+                    info["day_start"][y.day] = min(info["day_start"].get(y.day, 10 ** 9), y.abs_start)
+                info["others_first"] = self.first_end(cid)
+        return info
+
+    def legal_time(self, u, info, day, start):
+        """Rules that depend on other placed classes, for u at day/start."""
+        abs_start = day * model.DAY + start
+        if abs_start < info["lo"]:
+            return False
+        if abs_start < info["day_end"].get(day, 0):
+            return False                           # a lecture of the same subject is later that day
+        if info["min_y"] is not None:
+            abs_end = abs_start + u.length
+            if abs_end > info["day_start"].get(day, 10 ** 9):
+                return False                       # an exercise of the same subject is earlier that day
+            others = info["others_first"]
+            if abs_end > info["min_y"] and (others is None or others > info["min_y"]):
+                return False                       # this lecture would come after an already placed exercise
+        return True
+
+    def rules_ok(self, v):
+        """Check the rules for a placed unit against the current state."""
+        if len(self.chain_day.get((v.chain, v.day), ())) > 1:
+            return False
+        cid = id(v.course)
+        if v.course.kind == importer.EXERCISE:
+            for lc in self.lectures_of.get(cid, ()):
+                fe = self.first_end(lc)
+                if fe is None or v.abs_start < fe:
+                    return False
+                for x in self.course_units.get(lc, ()):
+                    if x.done and x.day == v.day and x.abs_end > v.abs_start:
+                        return False
+        else:
+            fe = self.first_end(cid)
+            for ec in self.exercises_of.get(cid, ()):
+                for y in self.course_units.get(ec, ()):
+                    if y.done and (y.abs_start < fe or (y.day == v.day and v.abs_end > y.abs_start)):
+                        return False
+        return True
+
+    def rules_hold(self, changed):
+        """After a tentative change: do the rules still hold for everything it could affect?"""
+        courses = set()
+        for u in changed:
+            cid = id(u.course)
+            courses.add(cid)
+            courses.update(self.lectures_of.get(cid, ()))
+            courses.update(self.exercises_of.get(cid, ()))
+        for cid in courses:
+            for v in self.course_units.get(cid, ()):
+                if v.done and not self.rules_ok(v):
+                    return False
+        return True
 
     def free_rooms(self, u, day, start):
         """Best free room per session at this time, or None if some session has no free room."""
@@ -182,15 +261,20 @@ class Scheduler:
     # ------------------------------------------------------------------ plain placement
     def place(self, u):
         lo = self.min_abs(u)
-        if lo is None:
+        info = self.rule_info(u)
+        if lo is None or info is None:
             return False
         best = None
         for day in range(self.ndays):
+            if self.chain_day.get((u.chain, day)):
+                continue                           # one session per day for a course group
             union = 0
             for res in u.resources:
                 union |= self.busy.get((res, day), 0)
             for start in u.starts:
                 if day * model.DAY + start < lo or union & self.mask(u.length, start):
+                    continue
+                if not self.legal_time(u, info, day, start):
                     continue
                 rooms = self.free_rooms(u, day, start)
                 if rooms is None:
@@ -260,12 +344,15 @@ class Scheduler:
 
     def try_insert(self, u, rng, max_blocked):
         lo = self.min_abs(u)
-        if lo is None:
+        info = self.rule_info(u)
+        if lo is None or info is None:
             return None
         best = []
         for day in range(self.ndays):
+            if self.chain_day.get((u.chain, day)):
+                continue
             for start in u.starts:
-                if day * model.DAY + start < lo:
+                if day * model.DAY + start < lo or not self.legal_time(u, info, day, start):
                     continue
                 full = self.blockers_at(u, day, start, max_blocked)
                 if full is None:
@@ -298,7 +385,7 @@ class Scheduler:
             if not self.place(b):
                 lost += b.hours
         gain = u.hours - lost
-        if gain > 0 or (gain == 0 and plateau):
+        if (gain > 0 or (gain == 0 and plateau)) and self.rules_hold([u] + moved):
             return gain
         for b in moved:
             if b.done:
@@ -317,7 +404,7 @@ class Scheduler:
         started = last_gain = last_log = time.time()
         iterations = gained = 0
         while time.time() - started < seconds and time.time() - last_gain < patience:
-            todo = [u for u in self.unplaced() if self.min_abs(u) is not None]
+            todo = [u for u in self.unplaced() if self.min_abs(u) is not None and self.rule_info(u) is not None]
             if not todo:
                 break
             u = rng.choice(todo)

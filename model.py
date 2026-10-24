@@ -1,10 +1,8 @@
-"""Step 2: Build, solve, and verify the timetable using OR-Tools CP-SAT."""
+"""Step 2: build the timetable (greedy + local search, see greedy.py) and verify it."""
 
 import datetime as dt
 from collections import defaultdict
 from dataclasses import dataclass, field
-
-from ortools.sat.python import cp_model
 
 import config
 import importer
@@ -97,58 +95,6 @@ def student_sets(session, groups):
     return result
 
 
-class Slot:
-    """One shared or individual scheduling decision."""
-
-    def __init__(self, model, name, length_min):
-        self.length_min = length_min
-        self.starts = valid_starts(length_min)
-
-        self.present = model.NewBoolVar(f"present_{name}")
-        self.on_day = [
-            model.NewBoolVar(f"day_{day}_{name}")
-            for day in range(config.NUM_DAYS)
-        ]
-        self.on_time = {
-            start: model.NewBoolVar(f"time_{start}_{name}")
-            for start in self.starts
-        }
-
-        # Scheduled slots have exactly one day and one start time.
-        model.Add(sum(self.on_day) == self.present)
-        model.Add(sum(self.on_time.values()) == self.present)
-
-        self.start = model.NewIntVar(
-            0,
-            max(0, (config.NUM_DAYS - 1) * DAY + config.DAY_END_MIN),
-            f"start_{name}",
-        )
-        model.Add(
-            self.start
-            == sum(
-                day * DAY * variable
-                for day, variable in enumerate(self.on_day)
-            )
-            + sum(
-                minute * variable
-                for minute, variable in self.on_time.items()
-            )
-        )
-
-        self.interval = model.NewOptionalFixedSizeIntervalVar(
-            self.start,
-            length_min,
-            self.present,
-            f"interval_{name}",
-        )
-
-    def on_days(self, days):
-        return sum(self.on_day[day] for day in days)
-
-    def at_times(self, times):
-        return sum(self.on_time[time] for time in times)
-
-
 def unmet_preferences(placement):
     """Return unmet soft requirements for a scheduled class."""
     if not placement.scheduled:
@@ -181,332 +127,6 @@ def unmet_preferences(placement):
         )
 
     return unmet
-
-
-class Progress(cp_model.CpSolverSolutionCallback):
-    """Print occasional objective updates during the search."""
-
-    def __init__(self, log):
-        super().__init__()
-        self.log = log
-        self.last_report = -15
-
-    def on_solution_callback(self):
-        elapsed = self.WallTime()
-        if elapsed - self.last_report >= 15:
-            self.last_report = elapsed
-            self.log(
-                f"  {elapsed:6.0f}s  "
-                f"total penalty {self.ObjectiveValue():,.0f}"
-            )
-
-
-def solve(sessions, log=print, fixed=None, seconds=None, hint=None):
-    """Schedule sessions. Return (placements, solver statistics).
-
-    fixed: optional {session id: Placement}. Those sessions are pinned to the given day, time and room.
-    hint: optional list of Placements used as the solver's starting point (e.g. from greedy.build).
-    """
-    sessions = list(sessions)
-
-    if not sessions:
-        return [], {
-            "status": "OPTIMAL",
-            "objective": 0,
-            "bound": 0,
-            "seconds": 0,
-        }
-
-    model = cp_model.CpModel()
-    slots = {}
-
-    by_teacher = defaultdict(list)
-    by_students = defaultdict(list)
-    by_room = defaultdict(list)
-    cohort_slots = defaultdict(list)
-    chains = defaultdict(list)
-    room_literals = {}
-    penalties = []
-
-    groups = cohort_groups(sessions)
-    weekend_days = [
-        day for day in range(config.NUM_DAYS)
-        if weekday(day) >= 5
-    ]
-
-    # Build one time slot per independent scheduling decision.
-    for session in sessions:
-        course = session.course
-        key = slot_key(session)
-
-        if key not in slots:
-            slot = slots[key] = Slot(
-                model,
-                str(session.id),
-                session.length * 60,
-            )
-
-            chain_key = (
-                id(course),
-                0 if course.parallel else session.group,
-            )
-            chains[chain_key].append(slot)
-
-        slot = slots[key]
-
-        # Penalize all teaching hours lost by leaving this slot unscheduled.
-        # (This loop already runs once per session, so parallel groups are counted once each.)
-        penalties.append(
-            config.W_UNSCHEDULED_PER_HOUR * session.length * (1 - slot.present)
-        )
-
-        # A slot must satisfy each preference or incur its penalty.
-        for requirement in course.requirements:
-            if requirement.kind in ("on_days", "not_day"):
-                acceptable_days = [
-                    day
-                    for day in range(config.NUM_DAYS)
-                    if requirement.ok(weekday(day), 0, 0)
-                ]
-                hit = slot.on_days(acceptable_days)
-            else:
-                acceptable_times = [
-                    start
-                    for start in slot.starts
-                    if requirement.ok(
-                        0,
-                        start,
-                        start + slot.length_min,
-                    )
-                ]
-                hit = slot.at_times(acceptable_times)
-
-            penalties.append(
-                config.W_REQUIREMENT * (slot.present - hit)
-            )
-
-        penalties.append(
-            config.W_WEEKEND * slot.on_days(weekend_days)
-        )
-        penalties.append(
-            config.W_LATE
-            * slot.at_times([
-                start for start in slot.starts
-                if start + slot.length_min > config.LATE_AFTER_MIN
-            ])
-        )
-
-        for teacher in session.teachers:
-            by_teacher[teacher].append(slot.interval)
-
-        for student_set in student_sets(session, groups):
-            by_students[student_set].append(slot.interval)
-            cohort_slots[student_set].append(
-                (slot, session.length)
-            )
-
-        # Each session needs its own room assignment.
-        if course.rooms:
-            literals = []
-
-            for rank, room in enumerate(course.rooms):
-                literal = model.NewBoolVar( # pyright: ignore[reportAttributeAccessIssue]
-                    f"room_{session.id}_{rank}"
-                )
-                interval = model.NewOptionalFixedSizeIntervalVar( # pyright: ignore[reportAttributeAccessIssue]
-                    slot.start,
-                    slot.length_min,
-                    literal,
-                    f"room_interval_{session.id}_{rank}",
-                )
-
-                by_room[room].append(interval)
-                penalties.append(
-                    config.W_ROOM[
-                        min(rank, len(config.W_ROOM) - 1)
-                    ] * literal
-                )
-                literals.append((room, rank, literal))
-
-            model.Add( # pyright: ignore[reportAttributeAccessIssue]
-                sum(literal for _, _, literal in literals)
-                == slot.present
-            )
-            room_literals[session.id] = literals
-
-    # No teacher, student group, or room may be double-booked.
-    for resource_map in (by_teacher, by_students, by_room):
-        for intervals in resource_map.values():
-            if len(intervals) > 1:
-                model.AddNoOverlap(intervals) # pyright: ignore[reportAttributeAccessIssue]
-
-    # Keep equal-length sessions in chronological order.
-    # Penalize scheduling multiple sessions in a chain on the same day.
-    course_of = {id(session.course): session.course for session in sessions}
-    for chain_key, chain in chains.items():
-        # Two sessions of the same lecture on one day with a break in between: strongly discouraged.
-        if course_of[chain_key[0]].kind == importer.LECTURE and config.W_SAME_DAY_GAP:
-            for i, a in enumerate(chain):
-                for b in chain[i + 1:]:
-                    same = model.NewBoolVar(f"same_day_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
-                    day_a = sum(d * v for d, v in enumerate(a.on_day))
-                    day_b = sum(d * v for d, v in enumerate(b.on_day))
-                    model.Add(day_a == day_b).OnlyEnforceIf(same) # pyright: ignore[reportAttributeAccessIssue]
-                    model.Add(day_a != day_b).OnlyEnforceIf(same.Not()) # pyright: ignore[reportAttributeAccessIssue]
-                    touch_ab = model.NewBoolVar(f"touch_ab_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
-                    touch_ba = model.NewBoolVar(f"touch_ba_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
-                    model.Add(a.start + a.length_min == b.start).OnlyEnforceIf(touch_ab) # pyright: ignore[reportAttributeAccessIssue]
-                    model.Add(a.start + a.length_min != b.start).OnlyEnforceIf(touch_ab.Not()) # pyright: ignore[reportAttributeAccessIssue]
-                    model.Add(b.start + b.length_min == a.start).OnlyEnforceIf(touch_ba) # pyright: ignore[reportAttributeAccessIssue]
-                    model.Add(b.start + b.length_min != a.start).OnlyEnforceIf(touch_ba.Not()) # pyright: ignore[reportAttributeAccessIssue]
-                    gapped = model.NewBoolVar(f"gapped_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
-                    model.AddBoolOr([a.present.Not(), b.present.Not(), same.Not(), touch_ab, touch_ba, gapped]) # pyright: ignore[reportAttributeAccessIssue]
-                    penalties.append(config.W_SAME_DAY_GAP * gapped)
-
-        for first, second in zip(chain, chain[1:]):
-            if first.length_min == second.length_min:
-                model.AddImplication(second.present, first.present) # pyright: ignore[reportAttributeAccessIssue]
-                model.Add( # pyright: ignore[reportAttributeAccessIssue]
-                    first.start + first.length_min <= second.start
-                ).OnlyEnforceIf([first.present, second.present])
-
-        if len(chain) > 1:
-            for day in range(config.NUM_DAYS):
-                extra = model.NewIntVar( # pyright: ignore[reportAttributeAccessIssue]
-                    0, len(chain), f"same_day_{day}_{len(penalties)}"
-                )
-                model.Add( # pyright: ignore[reportAttributeAccessIssue]
-                    extra >= sum(slot.on_day[day] for slot in chain) - 1
-                )
-                penalties.append(config.W_SAME_DAY * extra)
-
-    # Soft rule: an exercise should not begin before the first lecture of its subject has finished.
-    # Compared on the first session of each exercise group; nothing is charged if either side is unplaced.
-    courses = {id(session.course): session.course for session in sessions}
-    for lecture, exercise in importer.link_lectures(list(courses.values())):
-        lecture_chain = chains.get((id(lecture), 1))
-        if not lecture_chain:
-            continue
-        first_lecture = lecture_chain[0]
-        for key, chain in chains.items():
-            if key[0] != id(exercise):
-                continue
-            first_exercise = chain[0]
-            too_early = model.NewBoolVar(f"exercise_before_lecture_{len(penalties)}") # pyright: ignore[reportAttributeAccessIssue]
-            model.Add( # pyright: ignore[reportAttributeAccessIssue]
-                first_exercise.start >= first_lecture.start + first_lecture.length_min
-            ).OnlyEnforceIf([first_exercise.present, first_lecture.present, too_early.Not()])
-            penalties.append(config.W_LECTURE_FIRST * too_early)
-
-    # Penalize cohort daily loads above the configured comfort limit.
-    for student_set, entries in cohort_slots.items():
-        for day in range(config.NUM_DAYS):
-            daily_hours = sum(
-                hours * slot.on_day[day]
-                for slot, hours in entries
-            )
-            excess = model.NewIntVar( # pyright: ignore[reportAttributeAccessIssue]
-                0, 24, f"daily_excess_{day}_{len(penalties)}"
-            )
-            model.Add( # pyright: ignore[reportAttributeAccessIssue]
-                excess >= daily_hours - config.MAX_DAILY_HOURS
-            )
-            penalties.append(config.W_LONG_DAY * excess)
-
-    # Sessions placed in an earlier round stay exactly where they are.
-    for session in sessions:
-        placed = (fixed or {}).get(session.id)
-        if placed is None:
-            continue
-        slot = slots[slot_key(session)]
-        model.Add(slot.present == 1) # pyright: ignore[reportAttributeAccessIssue]
-        model.Add(slot.on_day[placed.day] == 1) # pyright: ignore[reportAttributeAccessIssue]
-        model.Add(slot.on_time[placed.start] == 1) # pyright: ignore[reportAttributeAccessIssue]
-        for room, _, literal in room_literals.get(session.id, ()):
-            model.Add(literal == int(room == placed.room)) # pyright: ignore[reportAttributeAccessIssue]
-
-    if hint:
-        hinted = {p.session.id: p for p in hint}
-        seen = set()
-        for session in sessions:
-            p = hinted.get(session.id)
-            if p is None:
-                continue
-            key = slot_key(session)
-            slot = slots[key]
-            if key not in seen:
-                seen.add(key)
-                model.AddHint(slot.present, int(p.scheduled)) # pyright: ignore[reportAttributeAccessIssue]
-                for d, var in enumerate(slot.on_day):
-                    model.AddHint(var, int(p.scheduled and d == p.day)) # pyright: ignore[reportAttributeAccessIssue]
-                for minute, var in slot.on_time.items():
-                    model.AddHint(var, int(p.scheduled and minute == p.start)) # pyright: ignore[reportAttributeAccessIssue]
-                model.AddHint(slot.start, p.day * DAY + p.start if p.scheduled else 0) # pyright: ignore[reportAttributeAccessIssue]
-            for room, _, literal in room_literals.get(session.id, ()):
-                model.AddHint(literal, int(p.scheduled and room == p.room)) # pyright: ignore[reportAttributeAccessIssue]
-
-    model.Minimize(sum(penalties)) # pyright: ignore[reportAttributeAccessIssue]
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = seconds or config.SOLVER_SECONDS
-    solver.parameters.num_workers = config.SOLVER_WORKERS
-    if hint:
-        solver.parameters.repair_hint = True
-
-    log(
-        f"Solving {len(sessions)} sessions across "
-        f"{config.NUM_DAYS} days..."
-    )
-
-    status = solver.Solve(model, Progress(log))
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError(
-            f"Solver did not find a timetable: "
-            f"{solver.StatusName(status)}"
-        )
-
-    placements = []
-
-    for session in sessions:
-        slot = slots[slot_key(session)]
-
-        if not solver.BooleanValue(slot.present):
-            placements.append(Placement(session))
-            continue
-
-        day = next(
-            d for d, variable in enumerate(slot.on_day)
-            if solver.BooleanValue(variable)
-        )
-
-        room, rank = None, 0
-        for candidate, candidate_rank, literal in room_literals.get(
-            session.id, ()
-        ):
-            if solver.BooleanValue(literal):
-                room, rank = candidate, candidate_rank
-                break
-
-        placement = Placement(
-            session=session,
-            scheduled=True,
-            day=day,
-            start=solver.Value(slot.start) - day * DAY,
-            room=room,
-            room_rank=rank,
-        )
-        placement.unmet = unmet_preferences(placement)
-        placements.append(placement)
-
-    stats = {
-        "status": solver.StatusName(status),
-        "objective": solver.ObjectiveValue(),
-        "bound": solver.BestObjectiveBound(),
-        "seconds": solver.WallTime(),
-    }
-
-    return placements, stats
 
 
 def split_hours(hours, target):
@@ -565,13 +185,15 @@ def renumber_parts(placements):
             p.session.part = i
 
 
-def solve_flexible(sessions, log=print):
-    """Greedy start (with length repair), local search, then CP-SAT improvement from that start."""
+def schedule(sessions, log=print):
+    """Greedy start with length re-cuts, then local search. Returns (placements, stats)."""
+    import time
+
     import greedy
 
     sessions = list(sessions)
     placements = greedy.build(sessions)
-    greedy_log = []
+    steps = []
     total = sum(s.length for s in sessions)
 
     def lost_hours(plist):
@@ -586,11 +208,10 @@ def solve_flexible(sessions, log=print):
         sessions = [p.session for p in kept] + new
         before = lost_hours(placements)
         placements = greedy.build(sessions, placed={p.session.id: p for p in kept})
-        greedy_log.append(f"greedy round {number} ({offset:+d} h): {before} -> {lost_hours(placements)} h unplaced")
-        log("  " + greedy_log[-1])
+        steps.append(f"greedy round {number} ({offset:+d} h): {before} -> {lost_hours(placements)} h unplaced")
+        log("  " + steps[-1])
 
     # --- local search with re-cutting, until it stalls, the time is up, or everything is placed
-    import time
     interrupted = False
     offset = 0
     phase_start = last_gain = time.time()
@@ -615,36 +236,11 @@ def solve_flexible(sessions, log=print):
                 log("  no gain for a long time - local search stops")
                 break
     except KeyboardInterrupt:
-        interrupted = True
         log("\nInterrupted - keeping the timetable found so far")
-    greedy_log.append(f"local search: {best} h unplaced")
-    if interrupted:
-        stats = {"status": "LOCAL SEARCH", "objective": 0, "bound": 0, "seconds": 0, "repair": greedy_log}
-        renumber_parts(placements)
-        return placements, stats
-
-    start = placements
-    stats = {"status": "LOCAL SEARCH", "objective": 0, "bound": 0, "seconds": 0}
-    if config.USE_CPSAT:
-        try:
-            candidate, cp_stats = solve(sessions, log, hint=start)
-        except RuntimeError as error:      # solver found nothing in time
-            log(f"  CP-SAT gave no result ({error}); keeping the local-search timetable")
-        else:
-            mine = sum(p.session.length for p in start if not p.scheduled)
-            theirs = sum(p.session.length for p in candidate if not p.scheduled)
-            if theirs <= mine:
-                placements, stats = candidate, cp_stats
-            else:                          # never trade placed classes for the solver's soft-preference polish
-                log(f"  CP-SAT left {theirs} h unplaced vs {mine} h from the local search; keeping the local search")
-    repair = list(greedy_log)
-    seconds = stats["seconds"]
-
-    # summary of the greedy / local-search steps
-    stats["seconds"] = seconds
-    stats["repair"] = repair
+    best = lost_hours(placements)
+    steps.append(f"local search: {best} h unplaced")
     renumber_parts(placements)
-    return placements, stats
+    return placements, {"steps": steps, "unplaced_hours": best, "seconds": round(time.time() - phase_start, 1)}
 
 
 def verify(placements):
@@ -721,5 +317,33 @@ def verify(placements):
                         f"'{second.session.course.subject[:30]}' "
                         f"overlap on {first.date}"
                     )
+
+    # --- one session per day for every course group
+    per_day = defaultdict(list)
+    for placement in placements:
+        if placement.scheduled:
+            s = placement.session
+            per_day[(id(s.course), 0 if s.course.parallel else s.group, placement.day)].append(placement)
+    for items in per_day.values():
+        slots = {slot_key(p.session) for p in items}   # parallel groups share one slot
+        if len(slots) > 1:
+            first = items[0]
+            problems.add(f"{first.session.course.subject[:40]}: {len(slots)} sessions of the same group on {first.date}")
+
+    # --- lecture before exercise (same subject, shared cohort)
+    courses = {id(s.course): s.course for s in sessions}
+    by_course = defaultdict(list)
+    for placement in placements:
+        if placement.scheduled:
+            by_course[id(placement.session.course)].append(placement)
+    for lecture, exercise in importer.link_lectures(list(courses.values())):
+        lectures = by_course.get(id(lecture), [])
+        for placement in by_course.get(id(exercise), []):
+            abs_start = placement.day * DAY + placement.start
+            if not lectures or min(x.day * DAY + x.end for x in lectures) > abs_start:
+                problems.add(f"{exercise.subject[:40]}: exercise on {placement.date} is not after the first lecture")
+            for x in lectures:
+                if x.day == placement.day and x.end > placement.start:
+                    problems.add(f"{exercise.subject[:40]}: lecture is not before the exercise on {placement.date}")
 
     return sorted(problems)

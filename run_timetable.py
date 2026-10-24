@@ -60,12 +60,12 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
     print(f"   Sessions: {len(sessions)}")
     print(f"   Total teaching hours: {sum(s.length for s in sessions)}")
 
-    print("\n2/5 Solving the timetable...")
+    print("\n2/5 Building the timetable...")
 
-    placements, stats = model.solve_flexible(sessions)
+    placements, stats = model.schedule(sessions)
 
-    for line in stats.get("repair", []):
-        print(f"   Repair {line}")
+    for line in stats["steps"]:
+        print(f"   {line}")
 
     print("\n3/5 Verifying hard constraints...")
 
@@ -130,14 +130,12 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
     )
 
     stats_df = pd.DataFrame([
-        {"Metric": "Solver status", "Value": stats["status"]},
-        {"Metric": "Objective penalty", "Value": stats["objective"]},
-        {"Metric": "Best objective bound", "Value": stats["bound"]},
-        {"Metric": "Solver time (seconds)", "Value": stats["seconds"]},
+        {"Metric": "Local search time (seconds)", "Value": stats["seconds"]},
+        {"Metric": "Hours unplaced", "Value": stats["unplaced_hours"]},
         {"Metric": "Input rows read", "Value": str(dict(rows_read))},
         {"Metric": "Courses imported", "Value": len(courses)},
-        {"Metric": "Sessions generated", "Value": len(placements)},
-        {"Metric": "Length repair rounds", "Value": "; ".join(stats.get("repair", [])) or "none needed"},
+        {"Metric": "Sessions after re-cutting", "Value": len(placements)},
+        {"Metric": "Search steps", "Value": "; ".join(stats["steps"]) or "none needed"},
         {"Metric": "Sessions scheduled", "Value": len(scheduled)},
         {"Metric": "Sessions unscheduled", "Value": len(unscheduled)},
         {"Metric": "Validation problems", "Value": len(validation_problems)},
@@ -167,7 +165,6 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
 
     print("\n5/5 Finished.")
     print(f"   Output: {output_path}")
-    print(f"   Solver status: {stats['status']}")
     print(f"   Scheduled sessions: {len(scheduled)}/{len(placements)}")
 
     if validation_problems:
@@ -180,10 +177,6 @@ def main(input_path=config.INPUT_FILE, output_path="timetable.xlsx"):
     if unscheduled:
         print("\nWARNING: Some sessions could not be scheduled. "
               "See the Unscheduled sheet.")
-
-    if stats["status"] != "OPTIMAL":
-        print("NOTE: The solver found a feasible solution but did not "
-              "prove that it is optimal, or the search ended early.")
 
 
 if __name__ == "__main__":

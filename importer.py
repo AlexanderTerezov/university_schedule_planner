@@ -74,9 +74,15 @@ class Course:
     requirements: tuple
 
     @property
-    def parallel(self):
-        """As many teachers as groups: group i is taught by teacher i and all groups run at the same time."""
+    def own_teacher(self):
+        """As many teachers as groups: group i is taught by teacher i only."""
         return self.groups > 1 and len(self.teachers) == self.groups
+
+    @property
+    def parallel(self):
+        """All groups run at the same time: each has its own teacher and (if rooms are listed) its own room.
+        With fewer rooms than groups they run one after another instead."""
+        return self.own_teacher and (not self.rooms or len(self.rooms) >= self.groups)
 
 
 @dataclass
@@ -327,15 +333,18 @@ def _build_course(rec, subject, teacher_index, spelling, note):
         note("WARNING", "no teacher - teacher clashes cannot be checked for this record")
     elif groups > 1 and len(teachers) > 1:
         if len(teachers) == groups:
-            note("INFO", f"{groups} groups and {groups} teachers - each group has its own teacher, groups run in parallel")
+            note("INFO", f"{groups} groups and {groups} teachers - each group has its own teacher")
         else:
             note("WARNING", f"{len(teachers)} teachers and {groups} groups - assumed ALL teachers attend EVERY session")
     rooms = parse_rooms(rec["rooms"], note)
     if not rooms:
         note("WARNING", "no room given")
-    if rooms and groups > 1 and len(teachers) == groups and len(rooms) < groups:
-        note("WARNING", f"{groups} groups run in parallel but only {len(rooms)} room(s) listed - "
-                        f"they cannot all be placed")
+    if rooms and groups > 1 and len(teachers) == groups:
+        if len(rooms) < groups:
+            note("INFO", f"{groups} groups but only {len(rooms)} room(s) listed - groups run one after another "
+                         f"(each with its own teacher)")
+        else:
+            note("INFO", f"{groups} groups run in parallel, each in its own room")
 
     return Course(rec["kind"], rec["sheet"], rec["row"], subject, hours, cohorts, groups, duration,
                   teachers, rooms, parse_requirements(rec["req"], note))
@@ -396,7 +405,7 @@ def expand_sessions(courses):
     sessions = []
     for course in courses:
         for group in range(1, course.groups + 1):
-            teachers = (course.teachers[group - 1],) if course.parallel else course.teachers
+            teachers = (course.teachers[group - 1],) if course.own_teacher else course.teachers
             left, part = course.hours, 0
             while left > 0:
                 length = min(course.duration, left)

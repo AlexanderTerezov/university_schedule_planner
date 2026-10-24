@@ -24,25 +24,15 @@ SLOT_MINUTES = 30                # classes start on multiples of this, counted f
 DEFAULT_GROUPS = 1               # exercises with an empty "Брой групи"
 DEFAULT_CONTINUATION = 3         # rows with an empty "Продължение" (3 is the most common value)
 
-# --- What makes a timetable "good" (penalties: the solver minimises the total) -----
-# Order of importance: leaving a class out >> breaking a preference from the sheet >> comfort.
-W_UNSCHEDULED_PER_HOUR = 1000    # per hour of a class that cannot be placed at all
+# --- What makes a timetable "good" (penalties: each class goes to the day/time/room with the lowest total) ---
+# Order of importance: breaking a preference from the sheet >> comfort. Placing a class always comes first.
 W_REQUIREMENT = 30               # per class that breaks a rule from "Изисквания"
 W_ROOM = (0, 4, 8)               # 1st, 2nd, 3rd room wish (later wishes cost the last value)
 W_WEEKEND = 6                    # per class on Saturday / Sunday
-W_SAME_DAY = 8                   # per extra class of the same subject+group on one day
 W_LONG_DAY = 5                   # per hour above MAX_DAILY_HOURS for a student cohort on one day
-W_SAME_DAY_GAP = 50              # per pair of sessions of the same LECTURE on one day with a break between them
-                                 # (back-to-back sessions only pay the small W_SAME_DAY above)
 MAX_DAILY_HOURS = 6
-W_LECTURE_FIRST = 20             # per exercise group whose first session is before the first lecture of its subject
 W_LATE = 2                       # per class that ends after LATE_AFTER
 LATE_AFTER = "18:00"
-
-# --- Solver ----------------------------------------------------------------------
-USE_CPSAT = False                # final CP-SAT polish of soft preferences; only kept if it places as many hours
-SOLVER_SECONDS = 900
-SOLVER_WORKERS = 0               # 0 = use all CPU cores
 
 # --- Flexible lesson length ------------------------------------------------------
 # The main search uses the usual length ("Продължение"). Classes it cannot place are then cut again
@@ -53,7 +43,7 @@ REPAIR_LENGTH_OFFSETS = (1, -1, 2, 3)
 MIN_LENGTH = 2                   # shortest class a repair round may create (1 allows single hours)
 MAX_LENGTH = 6                   # longest class a repair round may create
 
-# --- Local search (runs after the greedy start, before CP-SAT) ----------------------
+# --- Local search (runs after the greedy start) -------------------------------------
 # Moves a few placed classes out of the way for an unplaced one and re-places them; undone if hours are lost.
 # When it stops gaining, the unplaced hours are re-cut at the next length of REPAIR_LENGTH_OFFSETS and it goes on.
 # Ctrl+C during this phase stops it and writes the timetable found so far.
